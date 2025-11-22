@@ -9,10 +9,7 @@ use url::Url;
 
 use crate::{
     get_wallet_for,
-    zaps::{
-        get_users_zap_address,
-        networking::{fetch_invoice_promise, FetchedInvoiceResponse, LNUrlPayResponse, PayEntry},
-    },
+    zaps::{get_users_zap_address, networking::{fetch_invoice_promise, FetchedInvoiceResponse}},
     Accounts, GlobalWallet, ZapError,
 };
 
@@ -34,20 +31,20 @@ pub struct Zaps {
     pay_cache: PayCache,
 }
 
-/// Cache to hold LNURL payRequest responses from the desired LNURL endpoint
+/// Cache to hold fetched invoices
 #[derive(Default)]
 pub struct PayCache {
-    // endpoint URL to response
-    pub pay_responses: HashMap<Url, LNUrlPayResponse>,
+    // URL to invoice string
+    pub invoices: HashMap<Url, String>,
 }
 
 impl PayCache {
-    pub fn get_response(&self, url: &Url) -> Option<&LNUrlPayResponse> {
-        self.pay_responses.get(url)
+    pub fn get_invoice(&self, url: &Url) -> Option<&String> {
+        self.invoices.get(url)
     }
 
-    pub fn insert(&mut self, entry: PayEntry) {
-        self.pay_responses.insert(entry.url, entry.response);
+    pub fn insert(&mut self, url: Url, invoice: String) {
+        self.invoices.insert(url, invoice);
     }
 }
 
@@ -156,20 +153,41 @@ fn send_note_zap(
     ndb: &Ndb,
     txn: &Transaction,
     note_target: NoteZapTargetOwned,
-    msats: u64,
-    nsec: &[u8; 32],
-    relays: Vec<String>,
+    _msats: u64,
+    _nsec: &[u8; 32],
+    _relays: Vec<String>,
 ) -> Result<FetchingInvoice, ZapError> {
     let address = get_users_zap_address(txn, ndb, &note_target.zap_recipient)?;
+    let url = zap_address_to_url(&address)?;
 
-    fetch_invoice_promise(
-        cache,
-        address,
-        msats,
-        *nsec,
-        ZapTargetOwned::Note(note_target),
-        relays,
-    )
+    fetch_invoice_promise(cache, url)
+}
+
+fn zap_address_to_url(address: &crate::zaps::ZapAddress) -> Result<Url, ZapError> {
+    use crate::zaps::ZapAddress;
+
+    match address {
+        ZapAddress::Lud16(lud16) => {
+            let mut split = lud16.split('@');
+            let user = split
+                .next()
+                .ok_or_else(|| ZapError::InvalidLud16("lud16 did not have username".to_owned()))?;
+            let domain = split
+                .next()
+                .ok_or_else(|| ZapError::InvalidLud16("lud16 did not have domain".to_owned()))?;
+
+            let url_str = format!("https://{domain}/.well-known/lnurlp/{user}");
+            Url::parse(&url_str).map_err(|e| ZapError::endpoint_error(e.to_string()))
+        }
+        ZapAddress::Lud06(lnurl) => {
+            let (_, data) = bech32::decode(lnurl).map_err(|e| ZapError::Bech(e.to_string()))?;
+            let url_str = String::from_utf8(data)
+                .map_err(|e| ZapError::Bech(format!("string conversion: {e}")))?;
+            Url::parse(&url_str).map_err(|e| {
+                ZapError::endpoint_error(format!("endpoint url from lnurl is invalid: {e}"))
+            })
+        }
+    }
 }
 
 fn try_get_promise_response(
@@ -289,10 +307,12 @@ impl Zaps {
 
             if let PromiseResponse::FetchingInvoice { ctx: _, result } = &resp {
                 if let Ok(resp) = &**result {
-                    if let Some(entry) = &resp.pay_entry {
-                        let url = &entry.url;
-                        tracing::info!("inserting {url} in pay cache");
-                        self.pay_cache.insert(entry.clone());
+                    if resp.should_cache {
+                        if let Ok(fetched) = &resp.invoice {
+                            tracing::info!("inserting {} in pay cache", resp.url);
+                            self.pay_cache
+                                .insert(resp.url.clone(), fetched.invoice.clone());
+                        }
                     }
                 }
             }
